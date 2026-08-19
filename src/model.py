@@ -4,6 +4,14 @@ import torch
 import torch.nn as nn
 
 
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 class FallDetectorCNN(nn.Module):
     def __init__(self, in_channels: int = 9, num_classes: int = 2) -> None:
         super().__init__()

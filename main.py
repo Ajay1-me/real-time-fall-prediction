@@ -15,9 +15,9 @@ from sklearn.metrics import classification_report
 from sklearn.model_selection import GroupShuffleSplit
 from torch.utils.data import DataLoader
 
-from src.data import SisFallWindows, create_windows_with_record_idx, load_sisfall_dataset
+from src.data import SisFallWindows, create_windows_with_record_idx, load_sisfall_dataset, save_norm_stats
 from src.inference import simulate_adl_false_alarms, simulate_realtime_with_context
-from src.model import FallDetectorCNN, FallDetectorTCN
+from src.model import FallDetectorCNN, FallDetectorTCN, get_device
 from src.train import evaluate as evaluate_model
 from src.train import train_model
 
@@ -26,14 +26,6 @@ MODEL_CLASSES = {"cnn": FallDetectorCNN, "tcn": FallDetectorTCN}
 
 def resolve_checkpoint(args: argparse.Namespace) -> str:
     return args.checkpoint or f"best_fall_detector_{args.model}.pt"
-
-
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def load_and_split(data_root: str, window_size: int = 200, overlap: float = 0.5):
@@ -60,13 +52,19 @@ def load_and_split(data_root: str, window_size: int = 200, overlap: float = 0.5)
     for key, (X, y) in splits.items():
         splits[key] = ((X - mean) / std, y)
 
-    return splits, mean, std, signals, labels
+    subjects_by_split = {
+        "train": set(groups[train_idx]),
+        "val": set(groups[val_idx]),
+        "test": set(groups[test_idx]),
+    }
+
+    return splits, mean, std, signals, labels, meta, subjects_by_split
 
 
 def cmd_train(args: argparse.Namespace) -> None:
     device = get_device()
     checkpoint = resolve_checkpoint(args)
-    splits, _, _, _, _ = load_and_split(args.data_root)
+    splits, mean, std, _, _, _, _ = load_and_split(args.data_root)
     (X_train, y_train), (X_val, y_val) = splits["train"], splits["val"]
 
     train_loader = DataLoader(SisFallWindows(X_train, y_train), batch_size=args.batch_size, shuffle=True)
@@ -83,13 +81,14 @@ def cmd_train(args: argparse.Namespace) -> None:
         model, train_loader, val_loader, optimizer, criterion, device,
         num_epochs=args.epochs, patience=args.patience, checkpoint_path=checkpoint,
     )
-    print(f"Saved best checkpoint to {checkpoint}")
+    save_norm_stats(mean, std, args.norm_stats)
+    print(f"Saved best checkpoint to {checkpoint} and normalization stats to {args.norm_stats}")
 
 
 def cmd_evaluate(args: argparse.Namespace) -> None:
     device = get_device()
     checkpoint = resolve_checkpoint(args)
-    splits, _, _, _, _ = load_and_split(args.data_root)
+    splits, _, _, _, _, _, _ = load_and_split(args.data_root)
     X_test, y_test = splits["test"]
     test_loader = DataLoader(SisFallWindows(X_test, y_test), batch_size=args.batch_size, shuffle=False)
 
@@ -105,7 +104,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 def cmd_simulate(args: argparse.Namespace) -> None:
     device = get_device()
     checkpoint = resolve_checkpoint(args)
-    _, mean, std, signals, labels = load_and_split(args.data_root)
+    _, mean, std, signals, labels, _, _ = load_and_split(args.data_root)
 
     model = MODEL_CLASSES[args.model]().to(device)
     model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
@@ -136,6 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--patience", type=int, default=5)
     p_train.add_argument("--batch-size", type=int, default=128)
     p_train.add_argument("--lr", type=float, default=1e-3)
+    p_train.add_argument("--norm-stats", default="norm_stats.npz")
     p_train.set_defaults(func=cmd_train)
 
     p_eval = sub.add_parser("evaluate", help="Evaluate a checkpoint on the held-out test split")

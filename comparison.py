@@ -67,7 +67,7 @@ def main() -> None:
     args = parser.parse_args()
 
     device = get_device()
-    splits, _, _, _, _ = load_and_split(args.data_root)
+    splits, _, _, _, _, _, _ = load_and_split(args.data_root)
     X_train, y_train = splits["train"]
     X_test, y_test = splits["test"]
     test_loader = DataLoader(SisFallWindows(X_test, y_test), batch_size=args.batch_size, shuffle=False)

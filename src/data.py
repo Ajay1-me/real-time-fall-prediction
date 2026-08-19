@@ -72,6 +72,15 @@ def create_windows_with_record_idx(
     return np.array(X_list), np.array(y_list), np.array(rec_idx)
 
 
+def save_norm_stats(mean: np.ndarray, std: np.ndarray, path: str = "norm_stats.npz") -> None:
+    np.savez(path, mean=mean, std=std)
+
+
+def load_norm_stats(path: str = "norm_stats.npz") -> Tuple[np.ndarray, np.ndarray]:
+    stats = np.load(path)
+    return stats["mean"], stats["std"]
+
+
 class SisFallWindows(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray) -> None:
         # X: (N, T, C) -> (N, C, T) for Conv1d
