@@ -1,0 +1,8 @@
+SisFall_dataset/
+__pycache__/
+*.pyc
+.git/
+.ipynb_checkpoints/
+fall_prediction.ipynb
+best_fall_detector_tcn.pt
+.DS_Store
