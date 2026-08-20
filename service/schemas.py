@@ -1,11 +1,14 @@
 """Request/response schemas for the fall prediction service."""
 
+import os
 from typing import List
 
 from pydantic import BaseModel, Field, field_validator
 
 WINDOW_SIZE = 200
-NUM_CHANNELS = 9
+# MODEL_CHANNELS also controls which checkpoint/norm-stats files service/main.py
+# loads at startup, so this env var is the single source of truth for both.
+NUM_CHANNELS = int(os.environ.get("MODEL_CHANNELS", "9"))
 
 
 class WindowRequest(BaseModel):

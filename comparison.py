@@ -6,7 +6,7 @@ are trained inline since they're cheap.
 """
 
 import argparse
-from typing import Dict
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -15,10 +15,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 from torch.utils.data import DataLoader
 
-from main import get_device, load_and_split
+from main import CHANNEL_SUBSETS, get_device, load_and_split
 from src.data import SisFallWindows
 from src.inference import predict_proba
 from src.model import FallDetectorCNN, FallDetectorTCN
+
+CHANNEL_NAMES_9 = ["acc1_x", "acc1_y", "acc1_z", "gyro_x", "gyro_y", "gyro_z", "acc2_x", "acc2_y", "acc2_z"]
 
 
 def stats_features(X: np.ndarray) -> np.ndarray:
@@ -26,6 +28,31 @@ def stats_features(X: np.ndarray) -> np.ndarray:
     mu, sd = X.mean(axis=1), X.std(axis=1)
     mn, mx = X.min(axis=1), X.max(axis=1)
     return np.concatenate([mu, sd, mn, mx], axis=1)
+
+
+def feature_names(channel_names: List[str]) -> List[str]:
+    return (
+        [f"{c}_mean" for c in channel_names]
+        + [f"{c}_std" for c in channel_names]
+        + [f"{c}_min" for c in channel_names]
+        + [f"{c}_max" for c in channel_names]
+    )
+
+
+def print_acc2_importance_ranks(rf: RandomForestClassifier) -> None:
+    """Cross-check for the 6-channel variant: are the acc2_xyz features being
+    dropped actually low-importance in the 9-channel Random Forest (consistent
+    with a small accuracy cost), or high-importance (predicting a bigger hit)?"""
+    names = feature_names(CHANNEL_NAMES_9)
+    importances = dict(zip(names, rf.feature_importances_))
+    ranking = sorted(names, key=lambda n: importances[n], reverse=True)
+
+    print(f"\nRandom Forest feature importance cross-check ({len(names)} total features; "
+          f"acc2_* is what the 6-channel variant drops):")
+    for name in names:
+        if name.startswith("acc2_"):
+            rank = ranking.index(name) + 1
+            print(f"  {name:<12} importance={importances[name]:.4f}  rank={rank}/{len(names)}")
 
 
 def torch_model_metrics(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
@@ -62,6 +89,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Compare CNN vs TCN vs Random Forest vs Logistic Regression")
     parser.add_argument("--data-root", default="SisFall_dataset")
     parser.add_argument("--cnn-checkpoint", default="best_fall_detector_cnn.pt")
+    parser.add_argument("--cnn6-checkpoint", default="best_fall_detector_cnn_6ch.pt")
     parser.add_argument("--tcn-checkpoint", default="best_fall_detector_tcn.pt")
     parser.add_argument("--batch-size", type=int, default=128)
     args = parser.parse_args()
@@ -76,7 +104,15 @@ def main() -> None:
 
     cnn = FallDetectorCNN().to(device)
     cnn.load_state_dict(torch.load(args.cnn_checkpoint, map_location=device, weights_only=True))
-    results["CNN"] = torch_model_metrics(cnn, test_loader, device)
+    results["CNN (9-channel)"] = torch_model_metrics(cnn, test_loader, device)
+
+    splits_6ch, _, _, _, _, _, _ = load_and_split(args.data_root, channels=CHANNEL_SUBSETS[6])
+    X_test_6ch, y_test_6ch = splits_6ch["test"]
+    test_loader_6ch = DataLoader(SisFallWindows(X_test_6ch, y_test_6ch), batch_size=args.batch_size, shuffle=False)
+
+    cnn6 = FallDetectorCNN(in_channels=6).to(device)
+    cnn6.load_state_dict(torch.load(args.cnn6_checkpoint, map_location=device, weights_only=True))
+    results["CNN (6-channel, phone)"] = torch_model_metrics(cnn6, test_loader_6ch, device)
 
     tcn = FallDetectorTCN().to(device)
     tcn.load_state_dict(torch.load(args.tcn_checkpoint, map_location=device, weights_only=True))
@@ -94,6 +130,7 @@ def main() -> None:
 
     print()
     print_table(results)
+    print_acc2_importance_ranks(rf)
 
 
 if __name__ == "__main__":

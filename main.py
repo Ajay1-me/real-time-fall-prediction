@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -23,15 +24,33 @@ from src.train import train_model
 
 MODEL_CLASSES = {"cnn": FallDetectorCNN, "tcn": FallDetectorTCN}
 
+# Columns 0-5 are acc1_xyz + gyro_xyz (what a phone can provide); 6-8 are the
+# second wearable-only accelerometer (acc2_xyz), dropped in the 6-channel variant.
+CHANNEL_SUBSETS = {9: None, 6: [0, 1, 2, 3, 4, 5]}
+
+
+def _suffix(args: argparse.Namespace) -> str:
+    return "_6ch" if args.channels == 6 else ""
+
 
 def resolve_checkpoint(args: argparse.Namespace) -> str:
-    return args.checkpoint or f"best_fall_detector_{args.model}.pt"
+    return args.checkpoint or f"best_fall_detector_{args.model}{_suffix(args)}.pt"
 
 
-def load_and_split(data_root: str, window_size: int = 200, overlap: float = 0.5):
+def resolve_norm_stats(args: argparse.Namespace) -> str:
+    return args.norm_stats or f"norm_stats{_suffix(args)}.npz"
+
+
+def load_and_split(
+    data_root: str, window_size: int = 200, overlap: float = 0.5, channels: Optional[List[int]] = None,
+):
     """Loads SisFall, windows it, and reproduces the notebook's subject-wise
-    train/val/test split (random_state=42 makes this deterministic across runs)."""
+    train/val/test split (random_state=42 makes this deterministic across runs).
+    `channels` optionally selects a column subset (e.g. dropping acc2_xyz for
+    the phone-deployable 6-channel variant) before windowing."""
     signals, labels, meta = load_sisfall_dataset(data_root)
+    if channels is not None:
+        signals = [sig[:, channels] for sig in signals]
     X_all, y_all, rec_idx = create_windows_with_record_idx(signals, labels, window_size, overlap)
     groups = meta["subject"].values[rec_idx]
 
@@ -64,13 +83,14 @@ def load_and_split(data_root: str, window_size: int = 200, overlap: float = 0.5)
 def cmd_train(args: argparse.Namespace) -> None:
     device = get_device()
     checkpoint = resolve_checkpoint(args)
-    splits, mean, std, _, _, _, _ = load_and_split(args.data_root)
+    norm_stats = resolve_norm_stats(args)
+    splits, mean, std, _, _, _, _ = load_and_split(args.data_root, channels=CHANNEL_SUBSETS[args.channels])
     (X_train, y_train), (X_val, y_val) = splits["train"], splits["val"]
 
     train_loader = DataLoader(SisFallWindows(X_train, y_train), batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(SisFallWindows(X_val, y_val), batch_size=args.batch_size, shuffle=False)
 
-    model = MODEL_CLASSES[args.model]().to(device)
+    model = MODEL_CLASSES[args.model](in_channels=args.channels).to(device)
     class_weights = torch.tensor(
         len(y_train) / (2 * np.bincount(y_train).astype(np.float32)), dtype=torch.float32, device=device
     )
@@ -81,18 +101,18 @@ def cmd_train(args: argparse.Namespace) -> None:
         model, train_loader, val_loader, optimizer, criterion, device,
         num_epochs=args.epochs, patience=args.patience, checkpoint_path=checkpoint,
     )
-    save_norm_stats(mean, std, args.norm_stats)
-    print(f"Saved best checkpoint to {checkpoint} and normalization stats to {args.norm_stats}")
+    save_norm_stats(mean, std, norm_stats)
+    print(f"Saved best checkpoint to {checkpoint} and normalization stats to {norm_stats}")
 
 
 def cmd_evaluate(args: argparse.Namespace) -> None:
     device = get_device()
     checkpoint = resolve_checkpoint(args)
-    splits, _, _, _, _, _, _ = load_and_split(args.data_root)
+    splits, _, _, _, _, _, _ = load_and_split(args.data_root, channels=CHANNEL_SUBSETS[args.channels])
     X_test, y_test = splits["test"]
     test_loader = DataLoader(SisFallWindows(X_test, y_test), batch_size=args.batch_size, shuffle=False)
 
-    model = MODEL_CLASSES[args.model]().to(device)
+    model = MODEL_CLASSES[args.model](in_channels=args.channels).to(device)
     model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
     criterion = torch.nn.CrossEntropyLoss()
 
@@ -104,9 +124,9 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 def cmd_simulate(args: argparse.Namespace) -> None:
     device = get_device()
     checkpoint = resolve_checkpoint(args)
-    _, mean, std, signals, labels, _, _ = load_and_split(args.data_root)
+    _, mean, std, signals, labels, _, _ = load_and_split(args.data_root, channels=CHANNEL_SUBSETS[args.channels])
 
-    model = MODEL_CLASSES[args.model]().to(device)
+    model = MODEL_CLASSES[args.model](in_channels=args.channels).to(device)
     model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
 
     target_label = 1 if args.kind == "fall" else 0
@@ -126,25 +146,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint", default=None,
         help="Defaults to best_fall_detector_<model>.pt based on --model",
     )
-    parser.set_defaults(batch_size=128, model="cnn")  # so bare `python main.py` (-> cmd_evaluate) has these set
+    parser.set_defaults(batch_size=128, model="cnn", channels=9)  # bare `python main.py` (-> cmd_evaluate) needs these
     sub = parser.add_subparsers(dest="command")
 
     p_train = sub.add_parser("train", help="Train a model and save the best checkpoint")
     p_train.add_argument("--model", choices=MODEL_CLASSES.keys(), default="cnn")
+    p_train.add_argument(
+        "--channels", type=int, choices=CHANNEL_SUBSETS.keys(), default=9,
+        help="9 = full SisFall sensor set; 6 = phone-deployable (drops the second accelerometer, acc2_xyz)",
+    )
     p_train.add_argument("--epochs", type=int, default=30)
     p_train.add_argument("--patience", type=int, default=5)
     p_train.add_argument("--batch-size", type=int, default=128)
     p_train.add_argument("--lr", type=float, default=1e-3)
-    p_train.add_argument("--norm-stats", default="norm_stats.npz")
+    p_train.add_argument(
+        "--norm-stats", default=None, help="Defaults to norm_stats.npz, or norm_stats_6ch.npz for --channels 6",
+    )
     p_train.set_defaults(func=cmd_train)
 
     p_eval = sub.add_parser("evaluate", help="Evaluate a checkpoint on the held-out test split")
     p_eval.add_argument("--model", choices=MODEL_CLASSES.keys(), default="cnn")
+    p_eval.add_argument("--channels", type=int, choices=CHANNEL_SUBSETS.keys(), default=9)
     p_eval.add_argument("--batch-size", type=int, default=128)
     p_eval.set_defaults(func=cmd_evaluate)
 
     p_sim = sub.add_parser("simulate", help="Stream one recording through the model")
     p_sim.add_argument("--model", choices=MODEL_CLASSES.keys(), default="cnn")
+    p_sim.add_argument("--channels", type=int, choices=CHANNEL_SUBSETS.keys(), default=9)
     p_sim.add_argument("--kind", choices=["fall", "adl"], default="fall")
     p_sim.add_argument("--index", type=int, default=0, help="Which recording of that kind to use")
     p_sim.add_argument("--threshold", type=float, default=0.7)

@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fall Prediction - Phone Demo</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 480px; margin: 0 auto; padding: 16px; color: #222; }
+  h2 { margin-bottom: 4px; }
+  p.note { color: #555; font-size: 14px; }
+  label { display: block; font-size: 14px; margin-top: 12px; margin-bottom: 4px; }
+  input, button { font-size: 16px; padding: 10px; width: 100%; box-sizing: border-box; }
+  input { border: 1px solid #ccc; border-radius: 6px; }
+  button { margin-top: 10px; border: none; border-radius: 6px; cursor: pointer; background: #2563eb; color: white; }
+  button:disabled { background: #aaa; cursor: default; }
+  #stop-btn { background: #6b7280; }
+  #status { margin-top: 16px; color: #555; font-size: 14px; min-height: 20px; }
+  #prob-display { margin-top: 20px; text-align: center; }
+  #prob-value { font-size: 48px; font-weight: bold; }
+  #bar-container { background: #eee; border-radius: 6px; height: 24px; overflow: hidden; margin-top: 8px; }
+  #bar-fill { height: 100%; width: 0%; background: #4caf50; transition: width 0.2s ease, background 0.2s ease; }
+  #prob-display.fall #bar-fill { background: #dc2626; }
+  #prob-display.fall #prob-value { color: #dc2626; }
+</style>
+</head>
+<body>
+  <h2>Fall Prediction: Phone Demo</h2>
+  <p class="note">
+    Streams this phone's live accelerometer + gyroscope data to the 6-channel model
+    over the local network. See the README for setup and known accuracy limitations
+    of this demo -- this is a live streaming test, not a benchmark.
+  </p>
+
+  <label for="base-url">Service URL (laptop's local IP, port 8000, https)</label>
+  <input id="base-url" type="text" value="https://192.168.1.100:8000" placeholder="https://<laptop-ip>:8000">
+
+  <button id="start-btn">Start Streaming</button>
+  <button id="stop-btn" disabled>Stop</button>
+
+  <div id="status">Not started.</div>
+  <div id="diagnostics" style="font-size: 12px; color: #888;"></div>
+
+  <div id="prob-display">
+    <div id="prob-value">--</div>
+    <div id="bar-container"><div id="bar-fill"></div></div>
+  </div>
+
+<script>
+(function () {
+  const WINDOW_SIZE = 200;       // must match the 6-channel model's expected window length
+  const WINDOW_SECONDS = 1.0;    // matches the 200 samples @ 200Hz window the model was trained on
+  const PREDICT_INTERVAL_MS = 1000;
+  const BUFFER_MAX_SECONDS = 2.0; // a bit more than one window, so a full second is always available to resample from
+  const G = 9.80665; // m/s^2 per g -- DeviceMotionEvent reports SI units, SisFall's channels are stored in g
+
+  const baseUrlInput = document.getElementById('base-url');
+  const startBtn = document.getElementById('start-btn');
+  const stopBtn = document.getElementById('stop-btn');
+  const statusEl = document.getElementById('status');
+  const diagnosticsEl = document.getElementById('diagnostics');
+  const probValueEl = document.getElementById('prob-value');
+  const barFillEl = document.getElementById('bar-fill');
+  const probDisplayEl = document.getElementById('prob-display');
+
+  let buffer = []; // [{t: seconds, v: [ax, ay, az, gx, gy, gz]}, ...], oldest first
+  let predictTimer = null;
+  let diagnosticsTimer = null;
+  let eventCount = 0;
+  let rejectedEventCount = 0; // events seen but missing acceleration/rotationRate data
+  let lastEventWallClock = null; // Date.now() of the most recent devicemotion event received
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  function updateDiagnostics() {
+    const sinceLastEvent = lastEventWallClock === null ? 'never' : ((Date.now() - lastEventWallClock) / 1000).toFixed(1) + 's ago';
+    const span = buffer.length > 0 ? (buffer[buffer.length - 1].t - buffer[0].t).toFixed(2) : '0';
+    diagnosticsEl.textContent =
+      'events received: ' + eventCount + ' (rejected: ' + rejectedEventCount + ', last: ' + sinceLastEvent + ') | ' +
+      'buffer: ' + buffer.length + ' samples, ' + span + 's span';
+  }
+
+  function onDeviceMotion(event) {
+    eventCount++;
+    lastEventWallClock = Date.now();
+
+    // accelerationIncludingGravity (not `acceleration`) is used deliberately: it's what
+    // most browsers actually populate (plain `acceleration` is frequently null), and it
+    // matches SisFall's raw accelerometer readings, which physically always include
+    // the gravity component too.
+    const acc = event.accelerationIncludingGravity || event.acceleration;
+    const rot = event.rotationRate;
+    if (!acc || acc.x === null || acc.x === undefined || !rot || rot.alpha === null || rot.alpha === undefined) {
+      rejectedEventCount++;
+      return;
+    }
+
+    const t = (event.timeStamp || performance.now()) / 1000;
+    const ax = acc.x / G, ay = acc.y / G, az = acc.z / G;
+    // W3C DeviceOrientation axis convention: alpha = rotation around Z, beta = around X, gamma = around Y --
+    // reordered here to line up with the model's acc1_x/y/z, gyro_x/y/z channel order.
+    const gx = rot.beta, gy = rot.gamma, gz = rot.alpha;
+
+    buffer.push({ t: t, v: [ax, ay, az, gx, gy, gz] });
+
+    const cutoff = t - BUFFER_MAX_SECONDS;
+    while (buffer.length > 0 && buffer[0].t < cutoff) buffer.shift();
+  }
+
+  function linearResample(points, targetTimes) {
+    // points: sorted [{t, v: [...]}]; targetTimes: sorted array of times to sample at.
+    const out = [];
+    let i = 0;
+    for (let k = 0; k < targetTimes.length; k++) {
+      const tt = targetTimes[k];
+      while (i < points.length - 2 && points[i + 1].t < tt) i++;
+      const a = points[i], b = points[i + 1] || points[i];
+      const span = b.t - a.t;
+      const frac = span > 0 ? (tt - a.t) / span : 0;
+      const row = a.v.map(function (av, ch) { return av + (b.v[ch] - av) * frac; });
+      out.push(row);
+    }
+    return out;
+  }
+
+  async function tryPredict() {
+    if (buffer.length < 2) { setStatus('Buffering...'); return; }
+
+    const tEnd = buffer[buffer.length - 1].t;
+    const tStart = tEnd - WINDOW_SECONDS;
+    if (buffer[0].t > tStart) {
+      setStatus('Buffering... (' + (tEnd - buffer[0].t).toFixed(1) + 's / ' + WINDOW_SECONDS + 's)');
+      return;
+    }
+
+    const targetTimes = [];
+    for (let i = 0; i < WINDOW_SIZE; i++) {
+      targetTimes.push(tStart + (i / (WINDOW_SIZE - 1)) * WINDOW_SECONDS);
+    }
+    const windowData = linearResample(buffer, targetTimes);
+
+    const baseUrl = baseUrlInput.value.replace(/\/$/, '');
+    try {
+      const resp = await fetch(baseUrl + '/predict', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ window: windowData }),
+      });
+      if (!resp.ok) {
+        const detail = await resp.text();
+        throw new Error('HTTP ' + resp.status + ': ' + detail.slice(0, 200));
+      }
+      const data = await resp.json();
+      showPrediction(data.prob_fall, data.is_fall);
+      setStatus('Streaming...');
+    } catch (err) {
+      setStatus('Request failed: ' + err.message + ' -- check the service URL and that the phone and laptop are on the same WiFi.');
+    }
+  }
+
+  function showPrediction(prob, isFall) {
+    probValueEl.textContent = prob.toFixed(3);
+    barFillEl.style.width = (prob * 100).toFixed(0) + '%';
+    probDisplayEl.classList.toggle('fall', !!isFall);
+  }
+
+  function startListening() {
+    buffer = [];
+    eventCount = 0;
+    rejectedEventCount = 0;
+    lastEventWallClock = null;
+    window.addEventListener('devicemotion', onDeviceMotion);
+    predictTimer = setInterval(tryPredict, PREDICT_INTERVAL_MS);
+    diagnosticsTimer = setInterval(updateDiagnostics, 250);
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    setStatus('Buffering...');
+  }
+
+  function stopListening() {
+    window.removeEventListener('devicemotion', onDeviceMotion);
+    if (predictTimer) clearInterval(predictTimer);
+    if (diagnosticsTimer) clearInterval(diagnosticsTimer);
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    setStatus('Stopped.');
+  }
+
+  startBtn.addEventListener('click', function () {
+    if (typeof DeviceMotionEvent === 'undefined') {
+      setStatus('DeviceMotionEvent is not supported on this browser.');
+    } else if (typeof DeviceMotionEvent.requestPermission === 'function') {
+      // iOS 13+ requires an explicit user-gesture-triggered permission request.
+      DeviceMotionEvent.requestPermission().then(function (state) {
+        if (state === 'granted') startListening();
+        else setStatus('Motion permission denied.');
+      }).catch(function (err) { setStatus('Permission error: ' + err.message); });
+    } else {
+      // Most non-iOS browsers have no permission API -- motion data is available immediately.
+      startListening();
+    }
+  });
+
+  stopBtn.addEventListener('click', stopListening);
+})();
+</script>
+</body>
+</html>
