@@ -27,6 +27,62 @@ def accel_magnitude(raw_signal: np.ndarray) -> np.ndarray:
     return np.sqrt(ax * ax + ay * ay + az * az)
 
 
+def compute_window_probs(
+    model: nn.Module,
+    raw_signal: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+    device: torch.device,
+    window_size: int = 200,
+    step: int = 50,
+    fs: int = 200,
+    batch_size: int = 256,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Computes P(fall) for every window in a raw recording via batched forward
+    passes, instead of one call per window. Lets threshold/debounce be swept
+    cheaply afterward (see debounced_alerts) without recomputing the model for
+    every candidate threshold. Returns (times, probs), both shape (num_windows,).
+    """
+    model.eval()
+    raw_signal = raw_signal.astype(np.float32)
+    norm_signal = (raw_signal - mean.squeeze(0)) / std.squeeze(0)
+
+    starts = list(range(0, len(norm_signal) - window_size, step))
+    if not starts:
+        return np.array([]), np.array([])
+
+    windows = np.stack([norm_signal[s:s + window_size] for s in starts])  # (N, T, C)
+    times = np.array([(s + window_size / 2) / fs for s in starts])
+
+    probs = []
+    with torch.no_grad():
+        for i in range(0, len(windows), batch_size):
+            batch = windows[i:i + batch_size]
+            x = torch.from_numpy(batch).permute(0, 2, 1).to(device)  # (B, C, T)
+            p = torch.softmax(model(x), dim=1)[:, 1].cpu().numpy()
+            probs.append(p)
+    return times, np.concatenate(probs)
+
+
+def debounced_alerts(
+    times: np.ndarray, probs: np.ndarray, threshold: float, debounce_k: int = 2,
+) -> List[float]:
+    """Pure post-processing over precomputed per-window probabilities: returns
+    the list of alert times, requiring debounce_k consecutive windows above
+    threshold before confirming each alert (matches simulate_adl_false_alarms
+    and simulate_realtime_with_context's debounce logic)."""
+    alerts = []
+    consec = 0
+    for t, p in zip(times, probs):
+        if p >= threshold:
+            consec += 1
+            if consec == debounce_k:
+                alerts.append(t)
+        else:
+            consec = 0
+    return alerts
+
+
 def simulate_realtime_with_context(
     model: nn.Module,
     raw_signal: np.ndarray,
@@ -36,7 +92,7 @@ def simulate_realtime_with_context(
     window_size: int = 200,
     step: int = 50,
     fs: int = 200,
-    threshold: float = 0.7,
+    threshold: float = 0.90,
     debounce_k: int = 2,
     plot: bool = True,
 ) -> Tuple[List[float], List[float], float, Optional[float], Optional[float]]:
@@ -122,7 +178,7 @@ def simulate_adl_false_alarms(
     window_size: int = 200,
     step: int = 50,
     fs: int = 200,
-    threshold: float = 0.7,
+    threshold: float = 0.90,
     debounce_k: int = 2,
 ) -> Tuple[int, float]:
     model.eval()

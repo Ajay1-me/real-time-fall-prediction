@@ -24,7 +24,7 @@ from src.inference import accel_magnitude
 WINDOW_SIZE = 200
 STEP = 50
 FS = 200
-THRESHOLD = 0.7
+THRESHOLD = 0.90
 DEBOUNCE_K = 2
 
 

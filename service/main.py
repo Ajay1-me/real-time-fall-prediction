@@ -24,7 +24,7 @@ from src.saliency import grad_x_input_saliency
 _suffix = "_6ch" if NUM_CHANNELS == 6 else ""
 CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH", f"best_fall_detector_cnn{_suffix}.pt")
 NORM_STATS_PATH = os.environ.get("NORM_STATS_PATH", f"norm_stats{_suffix}.npz")
-FALL_THRESHOLD = 0.7
+FALL_THRESHOLD = 0.90
 
 state: Dict[str, object] = {}
 

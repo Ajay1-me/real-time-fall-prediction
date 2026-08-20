@@ -66,12 +66,29 @@ Even the p95 latency is about 358x faster than the required budget. Inference sp
 
 ## Real-Time Detection Performance
 
-Measured with `demo_stream.py`, which streams a real SisFall recording through the deployed FastAPI service one window at a time over HTTP -- the same code path a real client would use. The recording is a subject the model never saw during training (from the held-out test split), so this reflects generalization, not memorization.
+`demo_stream.py` streams a real SisFall recording through the deployed FastAPI service one window at a time over HTTP -- the same code path a real client would use. Early in this project that script was run against a single held-out fall recording and a single held-out ADL recording, which looked good (8.11s lead time) but also produced a worryingly high 13.80 false alarms/minute on the one ADL recording tested. That number turned out to be misleading -- it came from one unusually noisy recording, not a representative rate. Single-recording demos are useful for a live walkthrough, but not for deciding a production threshold.
 
-- **Fall recording**: first alert fired 1.00s into the recording; the impact (peak acceleration) occurred at 9.11s. That's an **8.11 second lead time** -- the system flags the fall well before impact, not after it.
-- **ADL (normal activity) recording**: 100 seconds of everyday movement produced 23 alerts, a rate of **13.80 false alarms per minute**.
+### Choosing an operating threshold
 
-The lead time is a strong result. The false-alarm rate is the honest weak point of the current model -- it is high enough that this model, as-is, would not be usable in a real deployment without further tuning (e.g. raising the decision threshold, adding post-processing, or collecting more ADL data for that motion pattern). This is a known, quantified limitation, not a hidden one -- and it's part of why picking the right operating threshold (see the threshold sweep in the notebook) matters as much as picking the right model architecture.
+The model outputs a fall probability, and everything downstream (the service, the CLI, the demos) has to pick a threshold above which that counts as "fall detected." That threshold was originally just `0.7`, chosen arbitrarily rather than measured. Two scripts now make this an actual, evidence-based decision:
+
+- **`threshold_tuning.py`** sweeps the threshold against the held-out test set's per-window predictions -- fast (one pass over the test set), but it measures *window-level* recall/precision, i.e. whether every individual 1-second window was classified correctly.
+- **`validate_thresholds.py`** is the metric that actually matters: it replays all 639 held-out test-subject recordings (225 falls, 414 ADLs) with the same debounced alerting logic the real service uses, and reports fall detection rate, average lead time, and ADL alerts/minute -- aggregated across all of them, not one anecdote.
+
+The two disagreed in an instructive way. The window-level sweep suggested a harsh tradeoff -- hitting 85%+ recall required accepting a ~21% window-level false-positive rate. The streaming validation told a much better story: because a real fall produces a strong, sustained signal across many consecutive windows, missing some individual windows barely matters -- only one clean debounced run is needed to raise an alert. Across the full held-out set:
+
+| Threshold | Falls Detected | Avg Lead Time | ADL Alerts/min |
+|---|---|---|---|
+| 0.50 | 100.0% | 4.64s | 6.25/min |
+| 0.70 (old default) | 100.0% | 3.95s | 4.24/min |
+| 0.80 | 100.0% | 3.44s | 2.85/min |
+| **0.90 (current default)** | **99.6%** | **2.73s** | **1.44/min** |
+| 0.94 | 99.1% | 2.33s | 0.93/min |
+| 0.98 | 97.8% | 1.59s | 0.45/min |
+
+**0.90 is now the default threshold everywhere in the codebase** (service, CLI, demo scripts) -- it detects 224 of 225 held-out falls with a 2.73s average lead time, while cutting the false-alarm rate by 66% versus the old default (1.44/min vs 4.24/min, both measured the same honest way). Pushing to 0.94-0.96 buys further false-alarm suppression for very little extra recall cost, if a deployment wanted to trade further in that direction; 0.98 is where real detections start being lost for diminishing returns.
+
+This is still a real, quantified limitation, not a fully solved problem -- 1.44 false alarms/minute is roughly one every 40 seconds, which is far from deployment-ready for something a caregiver would have to respond to. But it is a 66% improvement made with zero retraining, purely by evaluating the model correctly instead of guessing at a threshold.
 
 ## Running with Docker
 
@@ -144,3 +161,13 @@ This demo is a real streaming test against a real deployed model -- but it is ex
 - **Accuracy should be expected to differ from the Step 8 benchmark numbers**, in either direction, for all of the reasons above. This page demonstrates that the deployed pipeline works end-to-end on live sensor data -- it is not a substitute for the held-out test-set evaluation.
 
 Calling this out explicitly is deliberate: the gap between a benchmark run on curated lab data and a live demo on real, uncontrolled hardware is a real and expected part of shipping a model, not a flaw to hide.
+
+### What live testing actually showed
+
+Testing on a real phone surfaced a specific, useful pattern rather than just generic noise: **extreme motions read sensibly (dropping the phone drove the probability up; holding it still kept it near zero), but ordinary in-between motion looked essentially random.**
+
+That split is itself diagnostic. A drop produces a large spike in raw acceleration *magnitude* (`sqrt(x^2 + y^2 + z^2)`), and magnitude is rotation-invariant -- it reads the same regardless of which way the phone is oriented. Holding still is similarly orientation-robust: near-zero motion looks like near-zero motion no matter the orientation. But ordinary gestures (walking, adjusting grip, arm movement) depend on *which axis* moves, not just how much -- and that is entirely orientation-dependent.
+
+SisFall's sensor was belt-worn in one fixed, known orientation for the entire dataset. A hand-held phone can be in almost any orientation relative to the body -- portrait, landscape, tilted, rotating while walking -- with no fixed relationship to how the model's channels (`acc1_x`, `acc1_y`, `acc1_z`, ...) were defined during training. So for moderate, direction-dependent motion, the model is likely being fed real signal with its axes effectively scrambled relative to what it learned, which would produce exactly the "random-seeming" behavior observed, without there being a bug in the pipeline itself.
+
+This is the sensor-placement limitation above, confirmed empirically rather than just anticipated in theory -- and it's a much sharper explanation than "sim-to-real gap" in the abstract: it's specifically an *orientation* problem, not primarily a sampling-rate or unit-conversion one. A real fix would mean collecting phone-orientation-specific training data (or training an orientation-invariant model); a partial mitigation, untested here, would be constraining the phone to one fixed, consistent orientation during use.

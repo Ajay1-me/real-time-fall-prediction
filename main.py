@@ -175,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sim.add_argument("--channels", type=int, choices=CHANNEL_SUBSETS.keys(), default=9)
     p_sim.add_argument("--kind", choices=["fall", "adl"], default="fall")
     p_sim.add_argument("--index", type=int, default=0, help="Which recording of that kind to use")
-    p_sim.add_argument("--threshold", type=float, default=0.7)
+    p_sim.add_argument("--threshold", type=float, default=0.90)
     p_sim.set_defaults(func=cmd_simulate)
 
     return parser
